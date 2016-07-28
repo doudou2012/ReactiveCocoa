@@ -1644,81 +1644,40 @@ extension SignalProducerProtocol {
 		// `deinit`.
 		let token = DeallocationToken()
 
+		// The state of the caching producer.
 		let state: Atomic<ReplayState<Value, Error>> = Atomic(ReplayState(upTo: capacity))
 
-		let multicaster = SignalProducer<Value, Error> { observer, disposable in
-			var token: RemovalToken?
-
-			let replayBuffer = ReplayBuffer<Value>()
-			var replayValues: [Value] = []
-			var replayToken: RemovalToken?
-
-			var next = state.modify { state in
-				if state.values.isEmpty {
-					token = state.observers?.insert(observer)
-				} else {
-					replayValues = state.values
-					replayToken = state.replayBuffers.insert(replayBuffer)
-				}
-			}
-
-			while !replayValues.isEmpty {
-				replayValues.forEach(observer.sendNext)
-
-				next = state.modify { state in
-					replayValues = replayBuffer.values
-					replayBuffer.values = []
-					if replayValues.isEmpty {
-						if let replayToken = replayToken {
-							state.replayBuffers.remove(using: replayToken)
-						}
-						token = state.observers?.insert(observer)
-					}
-				}
-			}
-
-			if let terminationEvent = next.terminationEvent {
-				observer.action(terminationEvent)
-			}
-
-			if let token = token {
-				disposable += {
-					state.modify { state in
-						state.observers?.remove(using: token)
-					}
-				}
-			}
-		}
-
+		// The disposable which starts the underlying producer upon disposal.
 		let bootstrap = ActionDisposable {
-			// Start the underlying producer.
 			self.take(until: token.deallocSignal)
 				.start { event in
 					let originalState = state.modify { state in
-						if let value = event.value {
-							state.add(value)
-						} else {
-							// Disconnect all observers and prevent future
-							// attachments.
-							state.terminationEvent = event
-							state.observers = nil
-						}
+						state.add(event)
 					}
 
-					originalState.observers?.forEach { $0.action(event) }
+					originalState.multicast(event)
 				}
 		}
 
 		return SignalProducer { observer, disposable in
-			// subscribe `observer` before starting the underlying producer.
-			disposable += multicaster.start(observer)
-
 			// Don't dispose of the original producer until all observers
 			// have terminated.
 			disposable += { _ = token }
 
-			// Start the underlying producer if it has never been started.
-			bootstrap.dispose()
+			let status = ReplayState.replayCachedValues(to: observer, with: state)
+
+			switch status {
+			case let .terminated(event):
+				observer.action(event)
+
+			case let .attached(removalToken):
+				disposable += {
+					ReplayState.removeObserver(using: removalToken, from: state)
+				}
+
+				// Start the underlying producer if it has never been started.
+				bootstrap.dispose()
+			}
 		}
 	}
 }
@@ -1737,7 +1696,72 @@ private final class ReplayBuffer<Value> {
 	private var values: [Value] = []
 }
 
+/// An enum specifying whether the observer is attached to `ReplayState`, or
+/// the `ReplayState` has already received a terminating event.
+private enum ReplayStatus<Value, Error: ErrorProtocol> {
+	case terminated(event: Event<Value, Error>)
+	case attached(token: RemovalToken)
+}
+
 private struct ReplayState<Value, Error: ErrorProtocol> {
+	typealias Status = ReplayStatus<Value, Error>
+
+	/// Replay the cached values in the specified `ReplayState` to the supplied
+	/// observer, and then attach it to the `ReplayState`.
+	///
+	/// - parameters:
+	///   - observer: The observer to receive the replayed events and to be
+	///               attached.
+	///   - state: The caching state to be replayed.
+	static func replayCachedValues(to observer: Signal<Value, Error>.Observer, with state: Atomic<ReplayState>) -> Status {
+		var token: RemovalToken?
+
+		let replayBuffer = ReplayBuffer<Value>()
+		var replayValues: [Value] = []
+		var replayToken: RemovalToken?
+
+		var next = state.modify { state in
+			if state.values.isEmpty {
+				token = state.observers?.insert(observer)
+			} else {
+				replayValues = state.values
+				replayToken = state.replayBuffers.insert(replayBuffer)
+			}
+		}
+
+		while !replayValues.isEmpty {
+			replayValues.forEach(observer.sendNext)
+
+			next = state.modify { state in
+				replayValues = replayBuffer.values
+				replayBuffer.values = []
+				if replayValues.isEmpty {
+					if let replayToken = replayToken {
+						state.replayBuffers.remove(using: replayToken)
+					}
+					token = state.observers?.insert(observer)
+				}
+			}
+		}
+
+		if let token = token {
+			return .attached(token: token)
+		}
+
+		return .terminated(event: next.terminationEvent ?? .interrupted)
+	}
+
+	/// Remove an observer from the `ReplayState`.
+	///
+	/// - parameters:
+	///   - token: The token identifying the observer to remove.
+	///   - state: The state the observer to remove from.
+	static func removeObserver(using token: RemovalToken, from state: Atomic<ReplayState>) {
+		state.modify { state in
+			state.observers?.remove(using: token)
+		}
+	}
+
 	/// The capacity of the caching producer.
 	let capacity: Int
 
@@ -1760,29 +1784,41 @@ private struct ReplayState<Value, Error: ErrorProtocol> {
 		self.capacity = capacity
 	}
 
-	/// Cache a new value, and trim down the cache to the given capacity
+	/// Cache a new event, and trim down the cache to the given capacity
 	/// if necessary.
-	mutating func add(_ value: Value) {
-		for buffer in replayBuffers {
-			buffer.values.append(value)
-		}
+	mutating func add(_ event: Event<Value, Error>) {
+		if let value = event.value {
+			for buffer in replayBuffers {
+				buffer.values.append(value)
+			}
 
-		if capacity == 0 {
-			values = []
-			return
-		}
+			if capacity == 0 {
+				values = []
+				return
+			}
 
-		if capacity == 1 {
-			values = [ value ]
-			return
-		}
+			if capacity == 1 {
+				values = [ value ]
+				return
+			}
 
-		values.append(value)
+			values.append(value)
 
-		let overflow = values.count - capacity
-		if overflow > 0 {
-			values.removeSubrange(0..<overflow)
+			let overflow = values.count - capacity
+			if overflow > 0 {
+				values.removeSubrange(0..<overflow)
+			}
+		} else {
+			// Disconnect all observers and prevent future
+			// attachments.
+			terminationEvent = event
+			observers = nil
 		}
+	}
+
+	/// Multicast a new event to the observers.
+	func multicast(_ event: Event<Value, Error>) {
+		observers?.forEach { $0.action(event) }
 	}
 }
 
